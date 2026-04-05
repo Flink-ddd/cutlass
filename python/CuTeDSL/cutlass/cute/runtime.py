@@ -150,6 +150,7 @@ class _Tensor(Tensor):
         self._memref_desc = None
         self._dtype = None
         self._use_32bit_stride = use_32bit_stride
+        self._dynamic_marking_calls = []
 
     @property
     def __class__(self) -> Type[Tensor]:
@@ -193,6 +194,7 @@ class _Tensor(Tensor):
         :rtype: _Tensor
         """
         self._dltensor_wrapper.mark_layout_dynamic(leading_dim)
+        self._dynamic_marking_calls.append(('mark_layout_dynamic', (leading_dim,), {}))
         return self
 
     @lazily_load_dltensor
@@ -234,6 +236,7 @@ class _Tensor(Tensor):
         self._dltensor_wrapper.mark_compact_shape_dynamic(
             mode, stride_order, divisibility
         )
+        self._dynamic_marking_calls.append(('mark_compact_shape_dynamic', (mode, stride_order, divisibility), {}))
         return self
     @property
     @lazily_load_dltensor
