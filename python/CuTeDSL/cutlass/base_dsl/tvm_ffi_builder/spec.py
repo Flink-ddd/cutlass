@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -10,6 +10,7 @@
 # is strictly prohibited.
 
 """Kernel specification classes for TVM-FFI function parameters."""
+
 from abc import ABC
 
 from collections.abc import Sequence
@@ -19,6 +20,7 @@ try:
     import tvm_ffi
 except ModuleNotFoundError:
     pass
+
 
 class DefaultConfig:
     """Default configuration with context manager support."""
@@ -105,7 +107,7 @@ class Var(Param):
         dtype: Union[str, "tvm_ffi.dtype"],
         *,
         divisibility: Optional[int] = None,
-    ) ->  None:
+    ) -> None:
         """Initialize a Var parameter.
 
         Parameters
@@ -136,7 +138,11 @@ class Shape(Param):
     name: str
     shape: list[Union[int, Var]]
 
-    def __init__(self, name: str, shape: list[Union[int, Var]]) -> None:
+    def __init__(
+        self,
+        name: str,
+        shape: list[Union[int, Var]],
+    ) -> None:
         """Initialize a Shape parameter.
 
         Parameters
@@ -146,6 +152,9 @@ class Shape(Param):
         shape : list[int | Var]
             The shape of the parameter.
 
+        unpack_shape: bool
+            Whether to unpack the shape into list of arguments when calling
+            the call provider function.
         """
         self.name = name
         self.shape = shape
@@ -186,6 +195,7 @@ class Tensor(Param):
         dtype: Union[str, "tvm_ffi.dtype"],
         *,
         device_type: Optional[str] = None,
+        device_id: Optional[Var] = None,
         strides: Optional[Sequence[Var]] = None,
         map_tensor_dtype_f4x2_to_f4: bool = False,
         data_alignment: Optional[int] = None,
@@ -213,7 +223,9 @@ class Tensor(Param):
         self.data = Var(name + ".data", tvm_ffi.dtype("handle"))
         self.shape: list[Union[int, Var]] = list(shape)
         self.dtype = tvm_ffi.dtype(dtype)
-        self.strides: Optional[list[Var]] = list(strides) if strides is not None else None
+        self.strides: Optional[list[Var]] = (
+            list(strides) if strides is not None else None
+        )
         self.data_alignment = data_alignment
 
         # Use default device type if none specified
@@ -223,7 +235,10 @@ class Tensor(Param):
         example_device = tvm_ffi.device(device_type, 0)
         self.dlpack_device_type = example_device.dlpack_device_type()
         self.device_type_name = example_device.type
-        self.device_id = Var(name + ".device_id", tvm_ffi.dtype("int32"))
+        if device_id is None:
+            self.device_id = Var(name + ".device.index", tvm_ffi.dtype("int32"))
+        else:
+            self.device_id = device_id
         self.map_tensor_dtype_f4x2_to_f4 = map_tensor_dtype_f4x2_to_f4
 
 
@@ -301,6 +316,108 @@ class DataPointer(Param):
         self.address_space = address_space
 
 
+class ConstNone(Param):
+    """ConstNone parameter.
+
+    Parameters
+    ----------
+    name : str
+        The parameter name.
+    """
+
+    name: str
+
+    def __init__(self, name: str) -> None:
+        """Initialize a ConstExpr parameter.
+
+        Parameters
+        ----------
+        name : str
+            The parameter name.
+        """
+        self.name = name
+
+
+class TupleParam(Param):
+    """Tuple parameter.
+
+    Parameters
+    ----------
+    name : str
+        The parameter name.
+    """
+
+    name: str
+    params: list[Param]
+
+    def __init__(self, name: str, params: list[Param]) -> None:
+        """Initialize a TupleParam parameter.
+
+        Parameters
+        ----------
+        name : str
+            The parameter name.
+        params : list[Param]
+            The parameters of the tuple.
+        """
+        self.name = name
+        self.params = params
+
+
+def format_param_type(param: Param) -> str:
+    """Format a parameter type as a string, recursively handling nested types.
+
+    Parameters
+    ----------
+    param : Param
+        The parameter to format.
+
+    Returns
+    -------
+    str
+        The formatted type string.
+
+    Raises
+    ------
+    TypeError
+        If an unsupported parameter type is encountered.
+    """
+    if isinstance(param, Var):
+        return str(param.dtype)
+    elif isinstance(param, Tensor):
+        # Format tensor shape
+        shape_strs = []
+        for dim in param.shape:
+            if isinstance(dim, Var):
+                shape_strs.append(dim.name)
+            else:
+                shape_strs.append(str(dim))
+        shape_str = "[" + ", ".join(shape_strs) + "]"
+        return f"Tensor({shape_str}, {param.dtype})"
+    elif isinstance(param, Shape):
+        # Format shape parameter
+        shape_strs = []
+        for dim in param.shape:
+            if isinstance(dim, Var):
+                shape_strs.append(dim.name)
+            else:
+                shape_strs.append(str(dim))
+        shape_str = "[" + ", ".join(shape_strs) + "]"
+        return f"Shape({shape_str})"
+    elif isinstance(param, Stream):
+        return "Stream"
+    elif isinstance(param, DataPointer):
+        return "DataPointer"
+    elif isinstance(param, ConstNone):
+        return "None"
+    elif isinstance(param, TupleParam):
+        # Recursively format tuple elements
+        element_types = [format_param_type(p) for p in param.params]
+        return f"Tuple[{', '.join(element_types)}]"
+    else:
+        raise TypeError(f"Unsupported parameter type: {type(param)}")
+
+
 def signature(name: str, params: list[Param]) -> str:
     """Generate a function signature string from name and parameters.
 
@@ -325,39 +442,13 @@ def signature(name: str, params: list[Param]) -> str:
     param_strs = []
 
     for param in params:
-        if isinstance(param, Var):
-            param_str = f"{param.name}: {param.dtype}"
-        elif isinstance(param, Tensor):
-            # Format tensor shape
-            shape_strs = []
-            for dim in param.shape:
-                if isinstance(dim, Var):
-                    shape_strs.append(dim.name)
-                else:
-                    shape_strs.append(str(dim))
-            shape_str = "[" + ", ".join(shape_strs) + "]"
-            param_str = f"{param.name}: Tensor({shape_str}, {param.dtype})"
-        elif isinstance(param, Shape):
-            # Format shape parameter
-            shape_strs = []
-            for dim in param.shape:
-                if isinstance(dim, Var):
-                    shape_strs.append(dim.name)
-                else:
-                    shape_strs.append(str(dim))
-            shape_str = "[" + ", ".join(shape_strs) + "]"
-            param_str = f"{param.name}: Shape({shape_str})"
-        elif isinstance(param, Stream):
-            param_str = f"{param.name}: Stream"
-        elif isinstance(param, DataPointer):
-            param_str = f"{param.name}: DataPointer"
-        elif isinstance(param, EnvStream):
+        if isinstance(param, EnvStream):
             # env stream is not part of the FFI function signature
             # continue to skip append
             continue
-        else:
-            raise TypeError(f"Unsupported parameter type: {type(param)}")
 
+        param_type = format_param_type(param)
+        param_str = f"{param.name}: {param_type}"
         param_strs.append(param_str)
 
     return f"{name}({', '.join(param_strs)})"
@@ -387,6 +478,7 @@ def create_map_tensor_dtype_f4x2_to_f4_spec(f4_tensor_spec: Tensor) -> Tensor:
             if isinstance(stride, int) and stride == 1:
                 return i
         raise ValueError("Cannot find dimension with stride=1")
+
     stride_one_index = find_stride_one_index()
 
     def divisibility_divide_by_2(value: Var) -> Optional[int]:
@@ -403,7 +495,9 @@ def create_map_tensor_dtype_f4x2_to_f4_spec(f4_tensor_spec: Tensor) -> Tensor:
                     raise ValueError(f"Dimension {index} with stride=1 must be even")
                 return value // 2
             # create a new var with the same name and dtype
-            return Var(value.name, value.dtype, divisibility=divisibility_divide_by_2(value))
+            return Var(
+                value.name, value.dtype, divisibility=divisibility_divide_by_2(value)
+            )
         return value
 
     def map_stride(index: int, value: Union[int, Var]) -> Union[int, Var]:
@@ -413,7 +507,9 @@ def create_map_tensor_dtype_f4x2_to_f4_spec(f4_tensor_spec: Tensor) -> Tensor:
                     raise ValueError(f"Dimension {index} with stride != 1 must be even")
                 return value // 2
             # create a new var with the same name and dtype
-            return Var(value.name, value.dtype, divisibility=divisibility_divide_by_2(value))
+            return Var(
+                value.name, value.dtype, divisibility=divisibility_divide_by_2(value)
+            )
         return value
 
     new_shape = [map_shape(i, x) for i, x in enumerate(f4_tensor_spec.shape)]

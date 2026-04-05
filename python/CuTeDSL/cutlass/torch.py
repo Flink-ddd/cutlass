@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -13,7 +13,7 @@ import ctypes
 from math import prod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Type, Union
+from typing import Optional, Type, Union, Tuple, Literal
 
 from cutlass.cute.typing import (
     Numeric,
@@ -165,6 +165,16 @@ def create_and_permute_torch_tensor(
     return dtype_torch_tensor
 
 
+def get_leading_dim(torch_tensor: torch.Tensor) -> int:
+    """
+    Get the leading dimension of a torch tensor
+    """
+    for i, stride in enumerate(torch_tensor.stride()):
+        if stride == 1:
+            return i
+    return None
+
+
 def convert_cute_tensor(
     f32_torch_tensor: "torch.Tensor",
     cute_tensor: Tensor,
@@ -173,7 +183,7 @@ def convert_cute_tensor(
 ) -> Tensor:
     """
     Change the value of the cute tensor to make its value converted from a fp32 torch tensor.
-    Used for fp8 and int4 types tensor creatation now.
+    Used for fp8 and int4 types tensor creation now.
     """
     # if torch_tensor is on cpu, create a gpu copy
     if f32_torch_tensor.device.type == "cpu":
@@ -189,8 +199,10 @@ def convert_cute_tensor(
     }:
         fp32_cute_tensor = from_dlpack(f32_torch_tensor)
         if is_dynamic_layout:
+            # note: dim_order to not always maps to leading dimension,
+            # so we need to get the leading dimension from the torch tensor strides
             fp32_cute_tensor = fp32_cute_tensor.mark_layout_dynamic(
-                f32_torch_tensor.dim_order()[-1]
+                leading_dim=get_leading_dim(f32_torch_tensor)
             )
         # Copy and convert from f32 cute tensor to dtype cute tensor
         cute.testing.convert(fp32_cute_tensor, cute_tensor)
@@ -277,7 +289,9 @@ def cute_tensor_like(
     assumed_align: Optional[int] = None,
 ) -> tuple[Tensor, torch.Tensor]:
     """
-    Create a cute tensor use a torch tensor as the data source
+    Create a cute tensor use a torch tensor as the data source.
+
+    The cute tensor is a managed reference to the torch tensor.
 
     :param data_ref: torch tensor as the data source
     :param cutlass_dtype: cutlass dtype of the cute tensor
@@ -297,16 +311,16 @@ def cute_tensor_like(
     # create cute tensor using the device buffer
     cute_tensor = from_dlpack(torch_tensor, assumed_align=assumed_align)
     cute_tensor.element_type = cutlass_dtype
+
     if is_dynamic_layout:
-        for i, stride in enumerate(torch_tensor.stride()):
-            if stride == 1:
-                leading_dim = i
-                break
+        leading_dim = get_leading_dim(torch_tensor)
         cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
+    is_empty_tensor = torch_tensor.numel() == 0
     # initialize the cute tensor data
-    if (cutlass_dtype.is_float and cutlass_dtype.width <= 8) or (
-        cutlass_dtype.is_integer and cutlass_dtype.width == 4
+    if not is_empty_tensor and (
+        (cutlass_dtype.is_float and cutlass_dtype.width <= 8)
+        or (cutlass_dtype.is_integer and cutlass_dtype.width == 4)
     ):
         cute_tensor = convert_cute_tensor(
             data_ref.to(dtype=torch.float32),
@@ -316,5 +330,33 @@ def cute_tensor_like(
         )
     else:
         torch_tensor.copy_(data_ref.to(dtype=torch_dtype))
-
     return cute_tensor, torch_tensor
+
+
+def prepare_tensors_for_gemm(
+    mnkl: Tuple[int, int, int, int] | Tuple[int, int, int],
+    a_dtype: Type[Numeric],
+    b_dtype: Type[Numeric],
+    c_dtype: Type[Numeric],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Prepare tensors for GEMM
+    """
+    if len(mnkl) == 4:
+        m, n, k, l = mnkl
+        a = torch.empty(l, m, k, dtype=dtype(a_dtype), device="cuda").permute(1, 2, 0)
+        b = torch.empty(l, n, k, dtype=dtype(b_dtype), device="cuda").permute(1, 2, 0)
+        c = torch.empty(l, m, n, dtype=dtype(c_dtype), device="cuda").permute(1, 2, 0)
+    elif len(mnkl) == 3:
+        m, n, k = mnkl
+        a = torch.empty(m, k, dtype=dtype(a_dtype), device="cuda")
+        b = torch.empty(n, k, dtype=dtype(b_dtype), device="cuda")
+        c = torch.empty(m, n, dtype=dtype(c_dtype), device="cuda")
+    else:
+        raise ValueError(f"mnkl must be a tuple of length 3 or 4, but got {mnkl}")
+
+    a = a.random_(-2, 2)
+    b = b.random_(-2, 2)
+    c = c.random_(-2, 2)
+
+    return a, b, c

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -32,6 +32,9 @@ class Arch(Enum):
     sm_101 = (10, 1, "")
     sm_101a = (10, 1, "a")
     sm_101f = (10, 1, "f")
+    sm_103 = (10, 3, "")
+    sm_103a = (10, 3, "a")
+    sm_103f = (10, 3, "f")
     sm_110 = (11, 0, "")
     sm_110a = (11, 0, "a")
     sm_110f = (11, 0, "f")
@@ -41,7 +44,6 @@ class Arch(Enum):
     sm_121 = (12, 1, "")
     sm_121a = (12, 1, "a")
     sm_121f = (12, 1, "f")
-
     def __init__(self, major, minor, suffix):
         self.major = major
         self.minor = minor
@@ -56,7 +58,6 @@ class Arch(Enum):
             return cls((major, minor, suffix))
         else:
             raise ValueError(f"invalid arguments for Arch: {value}")
-        
 
     # attributes to get arch list of specific families
     @classmethod
@@ -80,6 +81,9 @@ class Arch(Enum):
             Arch.sm_101,
             Arch.sm_101a,
             Arch.sm_101f,
+            Arch.sm_103,
+            Arch.sm_103a,
+            Arch.sm_103f,
             Arch.sm_110,
             Arch.sm_110a,
             Arch.sm_110f,

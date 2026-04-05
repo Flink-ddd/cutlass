@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -38,6 +38,7 @@ class MLIRTypeBuilder:
         self.gpu_ptr_type = llvm.PointerType.get(address_space=1)
         # did not find a programmatic way to get the void type
         self.void_type = ir.Type.parse("!llvm.void")
+        self.llvm_internal_linkage = ir.Attribute.parse("#llvm.linkage<internal>")
 
     def ptr_type_with_address_space(
         self, address_space: Optional[int] = None
@@ -137,6 +138,7 @@ class MLIRBuilder(MLIRTypeBuilder):
         super().__init__()
         self.module: Optional[ir.Module] = None
         self.const_str_table: dict[str, ir.Value] = {}
+        self.const_func_ptr_table: dict[str, ir.Value] = {}
         self.get_element_extra_kwargs: dict[str, Any] = {}
 
     # create constants
@@ -231,7 +233,9 @@ class MLIRBuilder(MLIRTypeBuilder):
             remainder = llvm.urem(value, align_val)
             return self.equal(remainder, self.i64(0))
 
-    def br(self, target_block: ir.Block, *, args: Optional[list[ir.Value]] = None) -> None:
+    def br(
+        self, target_block: ir.Block, *, args: Optional[list[ir.Value]] = None
+    ) -> None:
         """Create an unconditional branch.
 
         Parameters
@@ -302,7 +306,10 @@ class MLIRBuilder(MLIRTypeBuilder):
         cond: ir.Value,
         true_block: ir.Block,
         false_block: ir.Block,
-        branch_weights=None
+        *,
+        branch_weights=None,
+        true_dest_operands: Sequence[ir.Value] = (),
+        false_dest_operands: Sequence[ir.Value] = (),
     ) -> None:
         """Create a conditional branch.
 
@@ -318,6 +325,10 @@ class MLIRBuilder(MLIRTypeBuilder):
             Optional branch weights [true_weight, false_weight] for optimization hints.
             Higher values indicate higher probability. For example, (99, 1) indicates
             the true branch is much more likely than the false branch.
+        true_dest_operands : Sequence[ir.Value]
+            Operands to pass to the true destination block.
+        false_dest_operands : Sequence[ir.Value]
+            Operands to pass to the false destination block.
         """
         if branch_weights is not None:
             # Branch weights should be a tuple/list of two integers [true_weight, false_weight]
@@ -325,17 +336,17 @@ class MLIRBuilder(MLIRTypeBuilder):
                 raise ValueError("branch_weights must have exactly 2 elements")
             llvm.cond_br(
                 cond,
-                true_dest_operands=[],
-                false_dest_operands=[],
+                true_dest_operands=true_dest_operands,
+                false_dest_operands=false_dest_operands,
                 true_dest=true_block,
                 false_dest=false_block,
-                branch_weights=ir.DenseI32ArrayAttr.get(list(branch_weights))
+                branch_weights=ir.DenseI32ArrayAttr.get(list(branch_weights)),
             )
         else:
             llvm.cond_br(
                 cond,
-                true_dest_operands=[],
-                false_dest_operands=[],
+                true_dest_operands=true_dest_operands,
+                false_dest_operands=false_dest_operands,
                 true_dest=true_block,
                 false_dest=false_block,
             )
@@ -360,6 +371,65 @@ class MLIRBuilder(MLIRTypeBuilder):
             self.const_str_table[content] = symbol
         return symbol
 
+    def get_or_load_global_func_ptr_from_text(
+        self,
+        current_block: ir.Block,
+        function_name: str,
+    ) -> ir.Value:
+        """Get or create a function pointer global in .text section and load it.
+
+        This creates a constant global function pointer in the .text section
+        (for AArch64 ADRP range compatibility) and performs a volatile load
+        to prevent optimization.
+
+        This forces the function pointer to be local to the code, bypassing GOT entry
+        ADRP lookup issues on AArch64 when GOT and .text section are more than 4GB
+        apart which can happen when ASLR is applied.
+        """
+        # Check if we've already created this global
+        if function_name not in self.const_func_ptr_table:
+            symbol = f"__func_ptr_{function_name}"
+
+            module_body = self.module.body
+            with ir.InsertionPoint(module_body):
+                # 1. Create the global constant
+                # We use 'private' linkage so it doesn't conflict across modules
+                global_ptr = llvm.GlobalOp(
+                    self.ptr_type,
+                    symbol,
+                    ir.Attribute.parse("#llvm.linkage<private>"),
+                    # Initialization via block below
+                )
+
+                # 2. Set the necessary attributes for JIT safety and AArch64 range
+                # We use 'constant' to mark it as immutable
+                # We use 'section = ".text"' to force it into the code block
+                global_ptr.attributes["constant"] = ir.UnitAttr.get()
+                global_ptr.attributes["section"] = ir.StringAttr.get(".text")
+
+                # 3. Add a constructor block to the GlobalOp to initialize it
+                # with the address of the target function
+                initializer_block = global_ptr.initializer.blocks.append()
+                with ir.InsertionPoint(initializer_block):
+                    # Get the address of the external function
+                    func_addr = llvm.AddressOfOp(self.ptr_type, function_name).res
+                    # Return the address as the initial value of the global
+                    llvm.return_(arg=func_addr)
+
+                self.const_func_ptr_table[function_name] = symbol
+        else:
+            symbol = self.const_func_ptr_table[function_name]
+
+        # Load it with volatile semantics in the current block
+        with ir.InsertionPoint(current_block):
+            symbol_addr = self.address_of(symbol, self.ptr_type)
+            # Perform a volatile load to prevent optimization
+            load_op = llvm.load(self.ptr_type, symbol_addr)
+            # Set volatile attribute to prevent optimization
+            load_op.owner.attributes["volatile_"] = ir.UnitAttr.get()
+            return load_op
+
+
     # function
     def function(
         self,
@@ -367,6 +437,7 @@ class MLIRBuilder(MLIRTypeBuilder):
         params_type: Sequence[ir.Type],
         ret_type: ir.Type,
         internal: bool = False,
+        llvm_func_attrs: Sequence[str] = (),
     ) -> tuple[list[ir.Value], ir.Block]:
         """Create a function with the given signature."""
         func_op = llvm.func(
@@ -376,9 +447,15 @@ class MLIRBuilder(MLIRTypeBuilder):
             ),
         )
         if internal:
-            func_op.attributes["llvm.linkage"] = ir.StringAttr.get("private")
+            func_op.attributes["linkage"] = self.llvm_internal_linkage
         else:
             func_op.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
+
+        # Add LLVM function attributes via passthrough
+        if llvm_func_attrs:
+            func_op.attributes["passthrough"] = ir.ArrayAttr.get(
+                [ir.StringAttr.get(attr) for attr in llvm_func_attrs]
+            )
 
         params = []
         func_body: Any = func_op.body
@@ -400,6 +477,17 @@ class MLIRBuilder(MLIRTypeBuilder):
             function_type=self.as_attr(func_type),
         )
         func_op.attributes["llvm.linkage"] = ir.StringAttr.get("external")
+
+    def create_alloca(self, entry_block: ir.Block, alloca_type: ir.Type, array_size: int) -> ir.Value:
+        """Create an alloca operation."""
+        with ir.InsertionPoint(entry_block.operations[0]):
+            # declare the struct type
+            alloca = llvm.alloca(
+                res=self.ptr_type,
+                elem_type=alloca_type,
+                array_size=self.i32(array_size),
+            )
+        return alloca
 
     def pack_values_to_alloca(
         self,
@@ -423,14 +511,11 @@ class MLIRBuilder(MLIRTypeBuilder):
         tuple[ir.Type, ir.Value]
             The struct type and the alloca.
         """
-        with ir.InsertionPoint(entry_block.operations[0]):
-            # declare the struct type
-            struct_type = self.struct_type(fields=[value.type for value in values])
-            alloca = llvm.alloca(
-                res=self.ptr_type,
-                elem_type=struct_type,
-                array_size=self.i32(1),
-            )
+        # Declare the struct type from the values
+        struct_type = self.struct_type(fields=[value.type for value in values])
+
+        # Create alloca using the helper method
+        alloca = self.create_alloca(entry_block, struct_type, array_size=1)
 
         with ir.InsertionPoint(current_block):
             for index, value in enumerate(values):

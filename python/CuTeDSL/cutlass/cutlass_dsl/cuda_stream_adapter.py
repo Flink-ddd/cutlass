@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -42,3 +42,7 @@ class CudaDialectStreamAdapter:
 
     def __get_mlir_types__(self):
         return [cuda.StreamType.get()]
+
+    def __cuda_stream__(self):
+        # support cuda stream protocol
+        return (0, int(self._arg))

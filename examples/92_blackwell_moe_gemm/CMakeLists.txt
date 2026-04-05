@@ -1,4 +1,4 @@
-# Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # Redistribution and use in source and binary forms, with or without
@@ -37,6 +37,7 @@ set(TEST_DEEPSEEK_B_FP4 --m=7168 --n=1 --k=512 --groups=256 --iterations=0)
 set(TEST_IRREGULAR_MNK_FP4 --m=4080 --n=9 --k=4160 --groups=8 --iterations=0)
 
 set(TEST_FIXED --m=2048 --n=5120 --k=8192 --iterations=0)                           # Fixed problem sizes
+set(TEST_FIXED_SMALL --m=2048 --n=512 --k=8192 --groups=2 --iterations=0)                           # Fixed problem sizes
 
 if (CUTLASS_NVCC_ARCHS MATCHES 100a)
 cutlass_example_add_executable(
@@ -60,6 +61,13 @@ cutlass_example_add_executable(
   92_blackwell_moe_gemm_rcgrouped.cu
   TEST_COMMAND_OPTIONS
   TEST_FIXED
+)
+
+cutlass_example_add_executable(
+  92_blackwell_moe_gemm_blockscaled_rcgrouped
+  92_blackwell_moe_gemm_blockscaled_rcgrouped.cu
+  TEST_COMMAND_OPTIONS
+  TEST_FIXED_SMALL
 )
 
 cutlass_example_add_executable(

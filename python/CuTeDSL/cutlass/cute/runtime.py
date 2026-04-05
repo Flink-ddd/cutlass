@@ -10,7 +10,6 @@
 # is strictly prohibited.
 
 import ctypes
-import os
 import sys
 from pathlib import Path
 from functools import lru_cache
@@ -18,16 +17,28 @@ import itertools
 import operator
 from typing import Union, Optional, Type, List
 
+
 # MLIR modules imports
 from cutlass._mlir import ir
+from cutlass.base_dsl.env_manager import get_prefix_dsl_libs
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass._mlir.dialects.cuda as _cuda_dialect
 
 from cutlass.cutlass_dsl import JitArgAdapterRegistry, CuTeDSL as _CuTeDSL
 from cutlass.base_dsl.common import DSLRuntimeError
+from cutlass.base_dsl.export import ExternalBinaryModule
 
 # Local modules imports
-from .typing import AddressSpace, Layout, Tensor, Pointer, Numeric, SymInt
+from .typing import (
+    AddressSpace,
+    Layout,
+    Tensor,
+    Pointer,
+    Numeric,
+    SymInt,
+    Float32,
+    TFloat32,
+)
 from . import core
 from .tensor import _Tensor as CoreTensor
 
@@ -69,7 +80,10 @@ class _Pointer(Pointer):
         else:
             self._assumed_align = assumed_align
 
-        self._c_pointer = None
+        self._desc = ctypes.c_void_p(int(self._pointer))
+        self._c_pointer = ctypes.addressof(self._desc)
+        self._c_pointers_cache = [self._c_pointer]
+
         assert int(self._pointer) % self._assumed_align == 0, (
             f"pointer must be {self._assumed_align} bytes aligned"
         )
@@ -85,10 +99,7 @@ class _Pointer(Pointer):
         return self._pointer
 
     def __c_pointers__(self):
-        if self._c_pointer is None:
-            self._desc = ctypes.c_void_p(int(self._pointer))
-            self._c_pointer = ctypes.addressof(self._desc)
-        return [self._c_pointer]
+        return self._c_pointers_cache
 
     def __new_from_mlir_values__(self, values):
         assert len(values) == 1
@@ -118,6 +129,10 @@ class _Pointer(Pointer):
     def __repr__(self):
         return self.__str__()
 
+    @property
+    def __cache_key__(self) -> tuple:
+        return (self.dtype, self._addr_space, self._assumed_align)
+
 
 class _Tensor(Tensor):
     def __init__(
@@ -131,6 +146,11 @@ class _Tensor(Tensor):
         # If tensor is already a DLPack object, use it directly
         if hasattr(tensor, "__dlpack_device__") and not hasattr(tensor, "__dlpack__"):
             self._dlpack_data = tensor.__dlpack_device__()
+        elif enable_tvm_ffi:
+            import tvm_ffi
+
+            self._tvm_ffi_tensor = tvm_ffi.from_dlpack(tensor)
+            self._dlpack_data = self._tvm_ffi_tensor.__dlpack__()
         else:
             try:
                 # we expect no stream sync. Because torch has different default behavior
@@ -139,11 +159,7 @@ class _Tensor(Tensor):
                 self._dlpack_data = tensor.__dlpack__(stream=-1)
             except Exception:
                 self._dlpack_data = tensor.__dlpack__()
-        if enable_tvm_ffi:
-            import tvm_ffi
 
-            self._tvm_ffi_tensor = tvm_ffi.from_dlpack(tensor)
-            self._dlpack_data = self._tvm_ffi_tensor.__dlpack__()
         self._dltensor_wrapper = None
         self._assumed_align = assumed_align
         self._is_dynamic = False
@@ -151,38 +167,41 @@ class _Tensor(Tensor):
         self._dtype = None
         self._use_32bit_stride = use_32bit_stride
         self._dynamic_marking_calls = []
+        self._c_pointers_cache = None
 
     @property
     def __class__(self) -> Type[Tensor]:
         # Cheat to let `type(_Tensor())` to return cute.Tensor
         return Tensor
 
-    def lazily_load_dltensor(func):
-        """Decorator to lazily load the DLTensorWrapper.
+    def load_dltensor(self):
+        """Lazily load the DLTensorWrapper.
 
-        This decorator loads the DLTensorWrapper when needed,
+        This function loads the DLTensorWrapper when needed,
         avoiding overhead in the critical path of calling JIT functions.
         """
+        if self._dltensor_wrapper is None:
+            self._dltensor_wrapper = _cute_ir.DLTensorWrapper(
+                self._dlpack_data, self._use_32bit_stride
+            )
 
-        def wrapper(self, *args, **kwargs):
-            if self._dltensor_wrapper is None:
-                self._dltensor_wrapper = _cute_ir.DLTensorWrapper(
-                    self._dlpack_data, self._use_32bit_stride
-                )
-            return func(self, *args, **kwargs)
-
-        return wrapper
-
-    @lazily_load_dltensor
     def mark_layout_dynamic(self, leading_dim: Optional[int] = None):
         """Marks the tensor layout as dynamic based on the leading dimension.
 
         :param leading_dim: The leading dimension of the layout, defaults to None
         :type leading_dim: int, optional
 
-        When ``leading_dim`` is None, automatically deduces the leading dimension from the tensor layout.
-        The layout can be deduced only when exactly one dimension has a stride of 1. Raises an error
-        if the layout cannot be automatically deduced.
+        When ``leading_dim`` is None, the leading dimension is deduced as follows.
+
+        (1) If exactly one dimension has stride 1, that dimension is used.
+
+        (2) If multiple dimensions have stride 1 but exactly one of them has size > 1,
+            that dimension is used.
+
+        (3) If multiple dimensions have stride 1 but none or more than one has size > 1,
+            an error is raised.
+
+        (4) If no dimension has stride 1, all strides remain dynamic.
 
         When ``leading_dim`` is explicitly specified, marks the layout as dynamic while setting the
         stride at ``leading_dim`` to 1. Also validates that the specified ``leading_dim`` is consistent
@@ -193,11 +212,11 @@ class _Tensor(Tensor):
         :return: The tensor with dynamic layout
         :rtype: _Tensor
         """
+        self.load_dltensor()
         self._dltensor_wrapper.mark_layout_dynamic(leading_dim)
         self._dynamic_marking_calls.append(('mark_layout_dynamic', (leading_dim,), {}))
         return self
 
-    @lazily_load_dltensor
     def mark_compact_shape_dynamic(
         self,
         mode: int,
@@ -209,6 +228,7 @@ class _Tensor(Tensor):
         :param mode: The mode of the compact shape, defaults to 0
         :type mode: int
         :param stride_order: Consistent with `torch.Tensor.dim_order`. Defaults to None.
+
         Indicates the order of the modes (dimensions) if the current layout were converted to row-major order.
         It starts from the outermost to the innermost dimension.
         :type stride_order: tuple[int, ...], optional
@@ -229,18 +249,19 @@ class _Tensor(Tensor):
 
         Using `torch.Tensor.dim_order()` to get the stride order of the torch tensor.
         .. code-block:: python
-            a = torch.empty(3, 4)
-            t = cute.runtime.from_dlpack(a)
-            t = t.mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
+        a = torch.empty(3, 4)
+        t = cute.runtime.from_dlpack(a)
+        t = t.mark_compact_shape_dynamic(mode=0, stride_order=a.dim_order())
         """
+        self.load_dltensor()
         self._dltensor_wrapper.mark_compact_shape_dynamic(
             mode, stride_order, divisibility
         )
         self._dynamic_marking_calls.append(('mark_compact_shape_dynamic', (mode, stride_order, divisibility), {}))
         return self
     @property
-    @lazily_load_dltensor
     def element_type(self) -> Type[Numeric]:
+        self.load_dltensor()
         if self._dtype is None:
             self._dtype = self._dltensor_wrapper.dtype
         return self._dtype
@@ -276,28 +297,35 @@ class _Tensor(Tensor):
         self._dtype = new_type
 
     @property
-    @lazily_load_dltensor
     def memspace(self):
+        self.load_dltensor()
         return self._dltensor_wrapper.address_space
 
     @property
-    @lazily_load_dltensor
     def size_in_bytes(self) -> int:
+        self.load_dltensor()
         return self._dltensor_wrapper.size_in_bytes()
 
     @property
-    @lazily_load_dltensor
     def mlir_type(self) -> ir.Type:
+        self.load_dltensor()
         return self._dltensor_wrapper.get_type(
             self.element_type.mlir_type, self._assumed_align
         )
 
-    @lazily_load_dltensor
     def __str__(self) -> str:
+        self.load_dltensor()
         return f"Tensor<0x{self._dltensor_wrapper.str}>"
 
     def __repr__(self):
         return self.__str__()
+
+    @property
+    def __cache_key__(self) -> tuple:
+        self.load_dltensor()
+        if self._dtype is None:
+            self._dtype = self._dltensor_wrapper.dtype
+        return (self._dtype, self._assumed_align, self._dltensor_wrapper.cache_key())
 
     def __setitem__(self, crd, value):
         raise TypeError("runtime._Tensor is not indexable")
@@ -306,8 +334,8 @@ class _Tensor(Tensor):
         raise TypeError("runtime._Tensor is not indexable")
 
     @property
-    @lazily_load_dltensor
     def iterator(self):
+        self.load_dltensor()
         return _Pointer(
             self._dltensor_wrapper.data_ptr,
             self.element_type,
@@ -322,13 +350,13 @@ class _Tensor(Tensor):
         )
 
     @property
-    @lazily_load_dltensor
     def shape(self):
+        self.load_dltensor()
         return self._dltensor_wrapper.shape
 
     @property
-    @lazily_load_dltensor
     def stride(self):
+        self.load_dltensor()
         strides = self._dltensor_wrapper.stride
         if strides is None:
             strides = itertools.accumulate(
@@ -358,28 +386,30 @@ class _Tensor(Tensor):
         raise TypeError("fill function is not supported in runtime")
 
     @property
-    @lazily_load_dltensor
     def data_ptr(self):
+        self.load_dltensor()
         return self._dltensor_wrapper.data_ptr
 
     @property
-    @lazily_load_dltensor
     def dynamic_shapes_mask(self):
         """Get the mask of dynamic shapes in the tensor."""
+        self.load_dltensor()
         return self._dltensor_wrapper.get_dynamic_shapes_mask()
 
     @property
-    @lazily_load_dltensor
     def dynamic_strides_mask(self):
         """Get the mask of dynamic strides in the tensor."""
+        self.load_dltensor()
         return self._dltensor_wrapper.get_dynamic_strides_mask()
 
-    @lazily_load_dltensor
     def __c_pointers__(self):
-        self._memref_desc = self._dltensor_wrapper.build_memref_desc(
-            self._assumed_align
-        )
-        return [_cute_ir.pycapsule_get_pointer(self._memref_desc)]
+        if self._c_pointers_cache is None:
+            self.load_dltensor()
+            self._memref_desc = self._dltensor_wrapper.build_memref_desc(
+                self._assumed_align
+            )
+            self._c_pointers_cache = [_cute_ir.pycapsule_get_pointer(self._memref_desc)]
+        return self._c_pointers_cache
 
     def __get_mlir_types__(self):
         return [self.mlir_type]
@@ -390,7 +420,16 @@ class _Tensor(Tensor):
         return CoreTensor(values[0].value, self._dtype)
 
     def __tvm_ffi_object__(self):
-        return self._tvm_ffi_tensor
+        try:
+            return self._tvm_ffi_tensor
+        except AttributeError:
+            raise DSLRuntimeError(
+                (
+                    "runtime._Tensor is not a TVM-FFI tensor. "
+                    "Enable TVM-FFI with `from_dlpack(..., enable_tvm_ffi=True)` "
+                    "or `CUTE_DSL_ENABLE_TVM_FFI=1`."
+                )
+            )
 
 
 def _get_cute_type_str(inp):
@@ -399,89 +438,6 @@ def _get_cute_type_str(inp):
 
     elems = [_convert_dyn_elem(e) if isinstance(e, SymInt) else str(e) for e in inp]
     return "(" + ",".join(elems) + ")"
-
-
-class _FakeCompactTensor(Tensor):
-    def __init__(
-        self,
-        dtype,
-        shape,
-        stride_order,
-        memspace=None,
-        assumed_align=None,
-        use_32bit_stride=False,
-    ):
-        self._dtype = dtype
-        self._shape = shape
-        self._stride_order = stride_order or tuple(range(len(shape)))
-        self._memspace = memspace or AddressSpace.gmem
-        self._assumed_align = assumed_align or -(-dtype.width // 8)
-        self._use_32bit_stride = use_32bit_stride
-
-    def __str__(self) -> str:
-        return f"FakeTensorOrdered<{self._dtype}, {self._shape}, {self._stride_order}>"
-
-    def __repr__(self):
-        return self.__str__()
-
-    @property
-    def mlir_type(self) -> ir.Type:
-        shape_ty = ir.Type.parse(
-            '!cute.shape<"' + _get_cute_type_str(self._shape) + '">'
-        )
-        layout_ty = _cute_ir.LayoutType.get_ordered(
-            shape_ty, self._stride_order, self._use_32bit_stride
-        )
-        self._stride = layout_ty.stride
-        ptr_ty = _cute_ir.PtrType.get(
-            self._dtype.mlir_type, self._memspace, self._assumed_align
-        )
-        return _cute_ir.MemRefType.get(ptr_ty, layout_ty)
-
-    def __get_mlir_types__(self):
-        return [self.mlir_type]
-
-    def __new_from_mlir_values__(self, values):
-        assert len(values) == 1
-        assert isinstance(values[0], CoreTensor)
-        return CoreTensor(values[0].value, self._dtype)
-
-    def __setitem__(self, crd, value):
-        raise DSLRuntimeError("runtime._FakeCompactTensor is not indexable")
-
-    def __getitem__(self, crd):
-        raise DSLRuntimeError("runtime._FakeCompactTensor is not indexable")
-
-    @property
-    def element_type(self) -> Type[Numeric]:
-        return self._dtype
-
-    @property
-    def memspace(self):
-        return self._memspace
-
-    @property
-    def iterator(self):
-        raise DSLRuntimeError("runtime._FakeTensor has dummy iterator")
-
-    @property
-    def shape(self):
-        return self._shape
-
-    @property
-    def stride(self):
-        return self._stride
-
-    @property
-    def dynamic_shapes_mask(self):
-        return tuple(1 if isinstance(e, SymInt) else 0 for e in self._shape)
-
-    @property
-    def dynamic_strides_mask(self):
-        return tuple(1 if isinstance(e, SymInt) else 0 for e in self._stride)
-
-    def fill(self, value: Numeric):
-        raise DSLRuntimeError("runtime._FakeCompactTensor is not writable")
 
 
 class _FakeTensor(Tensor):
@@ -497,9 +453,11 @@ class _FakeTensor(Tensor):
     :param dtype: Data type of the tensor elements
     :type dtype: Type[Numeric]
     :param shape: Shape of the tensor, consists of int (static) or SymInt (dynamic)
-    :type shape: tuple[int, ...]
+    :type shape: tuple[Union[int, SymInt], ...]
     :param stride: Stride of the tensor, defaults to None, consists of int (static) or SymInt (dynamic)
-    :type stride: tuple[int, ...], optional
+    :type stride: tuple[Union[int, SymInt], ...], optional
+    :param memspace: Memory space where the fake tensor resides. Defaults to AddressSpace.gmem.
+    :type memspace: AddressSpace, optional
     :param assumed_align: Assumed alignment of the tensor (bytes), defaults to None. If None, uses the element size bytes as the assumed alignment.
     :type assumed_align: int, optional
     :param use_32bit_stride: Whether to use 32-bit stride. Defaults to False. When True, the dynamic stride bitwidth
@@ -507,17 +465,25 @@ class _FakeTensor(Tensor):
         when the dimension is dynamic.
     :type use_32bit_stride: bool, optional
 
+
     """
 
-    def __init__(self, dtype, shape, *, stride, memspace=None, assumed_align=None):
+    def __init__(
+        self,
+        dtype: Type[Numeric],
+        shape: tuple[Union[int, SymInt], ...],
+        *,
+        stride: tuple[Union[int, SymInt], ...],
+        memspace: AddressSpace = AddressSpace.gmem,
+        assumed_align: int | None = None,
+        use_32bit_stride: bool = False,
+        compact: bool = False,
+    ):
         self._dtype = dtype
         self._shape = shape
         self._stride = stride
-        self._memspace = memspace or AddressSpace.generic
-        self._assumed_align = assumed_align
-        if assumed_align is None:
-            # use the bytes width of the element dtype. The alignment is at least one byte align.
-            self._assumed_align = (self._dtype.width + 7) // 8
+        self._use_32bit_stride = use_32bit_stride
+        self._compact = compact
 
         if not isinstance(shape, (tuple, list)):
             raise ValueError(f"Expected tuple or list but got {type(shape)}")
@@ -529,14 +495,21 @@ class _FakeTensor(Tensor):
             isinstance(s, (int, SymInt)) for s in self._stride
         ):
             raise ValueError("All stride elements must be int or SymInt")
+        self._memspace = memspace
+        self._assumed_align = assumed_align
+        if assumed_align is None:
+            # use the bytes width of the element dtype. The alignment is at least one byte align.
+            self._assumed_align = (self._dtype.width + 7) // 8
+
     @property
     def mlir_type(self) -> ir.Type:
         shape_str = _get_cute_type_str(self._shape)
         stride_str = _get_cute_type_str(self._stride)
         layout_ty = ir.Type.parse(f'!cute.layout<"{shape_str}:{stride_str}">')
-        ptr_ty = _cute_ir.PtrType.get(
-            self._dtype.mlir_type, self._memspace, self._assumed_align
-        )
+
+        # Boolean types are stored as i8 in memory
+        elem_type = T.i8() if self._dtype.width == 1 else self._dtype.mlir_type
+        ptr_ty = _cute_ir.PtrType.get(elem_type, self._memspace, self._assumed_align)
         return _cute_ir.MemRefType.get(ptr_ty, layout_ty)
 
     def __get_mlir_types__(self):
@@ -549,6 +522,42 @@ class _FakeTensor(Tensor):
 
     def __str__(self) -> str:
         return f"FakeTensor<{self._dtype}, {self._shape}, {self._stride}>"
+
+    @property
+    def __cache_key__(self) -> tuple:
+        # Check if any shape or stride element is a SymInt without a symbol
+        import warnings
+
+        has_unnamed_symint = False
+        for dim in self._shape:
+            if isinstance(dim, SymInt) and dim.symbol is None:
+                has_unnamed_symint = True
+                break
+        if not self._compact:
+            if not has_unnamed_symint:
+                for stride in self._stride:
+                    if isinstance(stride, SymInt) and stride.symbol is None:
+                        has_unnamed_symint = True
+                        break
+
+        if has_unnamed_symint:
+            warnings.warn(
+                "FakeTensor cache_key contains unnamed symbolic dimensions. "
+                "Different variables with the same shape/stride pattern will have "
+                "identical cache keys, which may cause incorrect cache hits. "
+                "Consider using 'symbol' parameter to distinguish variables: "
+                "cute.sym_int32(symbol='M'), cute.sym_int32(symbol='N')",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        return (
+            self._dtype,
+            self._memspace,
+            self._assumed_align,
+            self._shape,
+            self._stride,
+        )
 
     def __repr__(self):
         return self.__str__()
@@ -580,6 +589,10 @@ class _FakeTensor(Tensor):
         return self._stride
 
     @property
+    def leading_dim(self):
+        return core.leading_dim(self._shape, self._stride)
+
+    @property
     def dynamic_shapes_mask(self):
         return tuple(1 if isinstance(e, SymInt) else 0 for e in self._shape)
 
@@ -592,34 +605,36 @@ class _FakeTensor(Tensor):
 
 
 def make_fake_compact_tensor(
-    dtype,
-    shape,
+    dtype: Type[Numeric],
+    shape: tuple[Union[int, SymInt], ...],
     *,
-    stride_order=None,
-    memspace=None,
-    assumed_align=None,
-    use_32bit_stride=False,
+    stride_order: Optional[tuple[int, ...]] = None,
+    memspace: AddressSpace = AddressSpace.gmem,
+    assumed_align: Optional[int] = None,
+    use_32bit_stride: bool = False,
 ):
     """
     Create a fake tensor with the specified shape, element type, and a compact memory layout.
 
     :param dtype: Data type of the tensor elements.
     :type dtype: Type[Numeric]
-    :param shape: Shape of the tensor.
-    :type shape: tuple[int, ...]
+    :param shape: Shape of the tensor, consisting of static (int) or dynamic (SymInt) dimensions.
+    :type shape: tuple[Union[int, SymInt], ...]
     :param stride_order: Order in which strides (memory layout) are assigned to the tensor dimensions.
-        If None, the default layout is row-major. Otherwise, it should be a permutation of the dimension indices.
+        If None, the default layout is left-to-right order (known as column-major order for flatten layout).
+        Otherwise, it should be a permutation order of the dimension indices.
+        The mode with stride_order 0 is the fastest changing (leading) dimension, and N-1 is the slowest changing.
     :type stride_order: tuple[int, ...], optional
-    :param memspace: Memory space where the fake tensor resides. Optional.
-    :type memspace: str, optional
-    :param assumed_align: Assumed byte alignment for the tensor data. If None, the default alignment is used.
+    :param memspace: Memory space where the fake tensor resides. Defaults to AddressSpace.gmem.
+    :type memspace: AddressSpace, optional
+    :param assumed_align: Assumed byte alignment for the tensor data. If None, the default alignment is the dtype width, & at least 1 byte.
     :type assumed_align: int, optional
     :param use_32bit_stride: Whether to use 32-bit stride for dynamic dimensions. If True and the total size of the
         layout (cosize(layout)) fits within int32, then dynamic strides will use 32-bit integers for improved performance.
         Only applies when dimensions are dynamic. Defaults to False.
     :type use_32bit_stride: bool, optional
     :return: An instance of a fake tensor with the given properties and compact layout.
-    :rtype: _FakeCompactTensor
+    :rtype: _FakeTensor
 
     **Examples:**
 
@@ -636,28 +651,69 @@ def make_fake_compact_tensor(
         # Compiled function will take a tensor with the type:
         #   tensor<ptr<f32, generic> o (100,?{div=8}):(?{i32 div=8},1)>
         compiled_foo = cute.compile(foo, x)
+
+        # Default stride order is left-to-right order (0, 1, ..., n-1)
+        y = make_fake_compact_tensor(cutlass.Float32, (8, 3, 2)) # y.stride == (1, 8, 24)
     """
 
-    return _FakeCompactTensor(
+    if stride_order is not None:
+        if len(stride_order) != len(shape):
+            raise ValueError(
+                f"stride_order ({stride_order}) must be empty or have same length as shape ({shape})."
+            )
+    else:
+        # Default stride order is left-to-right
+        stride_order = stride_order or tuple(range(len(shape)))
+
+    # Make compact strides (possibly symbolic) from shape & stride_order
+    stride = [None] * len(stride_order)
+    stride_product = 1
+    for order in range(len(stride_order)):
+        idx = stride_order.index(order)
+        stride[idx] = stride_product
+        stride_product *= shape[idx]
+
+    stride_width = 32 if use_32bit_stride else 64
+    stride = tuple(
+        (
+            SymInt(width=stride_width, divisibility=s.divisibility)
+            if isinstance(s, SymInt)
+            else s
+        )
+        for s in stride
+    )
+
+    return _FakeTensor(
         dtype,
         shape,
-        stride_order=stride_order,
+        stride=stride,
         memspace=memspace,
         assumed_align=assumed_align,
         use_32bit_stride=use_32bit_stride,
+        compact=True,
     )
 
-def make_fake_tensor(dtype, shape, stride, *, memspace=None, assumed_align=None):
+
+def make_fake_tensor(
+    dtype: Type[Numeric],
+    shape: tuple[Union[int, SymInt], ...],
+    stride: tuple[Union[int, SymInt], ...],
+    *,
+    memspace: AddressSpace = AddressSpace.gmem,
+    assumed_align: Optional[int] = None,
+):
     """
     Create a fake tensor with the specified element type, shape, and stride.
 
     :param dtype: Data type of the tensor elements.
     :type dtype: Type[Numeric]
-    :param shape: Shape of the tensor.
-    :type shape: tuple[int, ...]
-    :param stride: Stride of the tensor.
-    :type stride: tuple[int, ...]
-    :param assumed_align: Assumed byte alignment for the tensor data. If None, the default alignment is used. Defaults to None.
+    :param shape: Shape of the tensor, consisting of static (int) or dynamic (SymInt) dimensions.
+    :type shape: tuple[Union[int, SymInt], ...]
+    :param stride: Stride of the tensor, consisting of static (int) or dynamic (SymInt) values.
+    :type stride: tuple[Union[int, SymInt], ...]
+    :param memspace: Memory space where the fake tensor resides. Defaults to AddressSpace.gmem.
+    :type memspace: AddressSpace, optional
+    :param assumed_align: Assumed byte alignment for the tensor data. If None, the default alignment is the dtype width, & at least 1 byte.
     :type assumed_align: int, optional
     :return: An instance of a fake tensor with the given properties.
     :rtype: _FakeTensor
@@ -719,6 +775,7 @@ def from_dlpack(
     use_32bit_stride=False,
     *,
     enable_tvm_ffi=False,
+    force_tf32=False,
 ) -> Tensor:
     """Convert from tensor object supporting __dlpack__() to a CuTe Tensor.
 
@@ -734,6 +791,8 @@ def from_dlpack(
     :param enable_tvm_ffi: Whether to enable TVM-FFI, defaults to False. When True, the tensor will be converted to
       a TVM-FFI function compatible tensor.
     :type enable_tvm_ffi: bool, optional
+    :param force_tf32: Whether to force the element type to TFloat32 if the element type is Float32.
+    :type force_tf32: bool, optional
     :return: A CuTe Tensor object
     :rtype: Tensor
 
@@ -753,12 +812,15 @@ def from_dlpack(
     # If the environment variable `CUTE_DSL_ENABLE_TVM_FFI` is set to True, the tensor will be converted to
     # a TVM-FFI function compatible tensor.
     enable_tvm_ffi = enable_tvm_ffi or _CuTeDSL._get_dsl().envar.enable_tvm_ffi
-    return _Tensor(
+    res = _Tensor(
         tensor_dlpack,
         assumed_align=assumed_align,
         use_32bit_stride=use_32bit_stride,
         enable_tvm_ffi=enable_tvm_ffi,
     )
+    if force_tf32 and res.element_type == Float32:
+        res.element_type = TFloat32
+    return res
 
 
 def make_ptr(
@@ -840,15 +902,21 @@ class TensorAdapter:
 
     def __init__(self, arg):
         self._arg = from_dlpack(arg).mark_layout_dynamic()
+        self._c_pointers_cache = None
+        self._mlir_types_cache = None
 
     def __new_from_mlir_values__(self, values):
         return self._arg.__new_from_mlir_values__(values)
 
     def __c_pointers__(self):
-        return self._arg.__c_pointers__()
+        if self._c_pointers_cache is None:
+            self._c_pointers_cache = self._arg.__c_pointers__()
+        return self._c_pointers_cache
 
     def __get_mlir_types__(self):
-        return self._arg.__get_mlir_types__()
+        if self._mlir_types_cache is None:
+            self._mlir_types_cache = self._arg.__get_mlir_types__()
+        return self._mlir_types_cache
 
 
 def find_runtime_libraries(*, enable_tvm_ffi: bool = True) -> List[str]:
@@ -861,26 +929,27 @@ def find_runtime_libraries(*, enable_tvm_ffi: bool = True) -> List[str]:
     :rtype: list
     """
 
-    def _get_cuda_dialect_runtime_path():
-        libs = os.environ.get("CUTE_DSL_LIBS")
-        if libs:
-            sep = ";" if sys.platform.startswith("win32") else ":"
-            for path in libs.split(sep):
-                if path.endswith("libcuda_dialect_runtime.so"):
-                    return path
-        try:
-            # find package library from wheel package
-            pkg_base = Path(__file__).resolve().parent.parent
-            lib_path = pkg_base / "lib" / "libcuda_dialect_runtime.so"
-            if lib_path.is_file():
-                return str(lib_path)
-        except OSError:
+    def _get_cute_dsl_runtime_path():
+        libs = get_prefix_dsl_libs("CUTE_DSL")
+        if libs is None:
             return None
 
+        # check if the separator is ; for windows
+        if sys.platform.startswith("win32") and ";" in libs:
+            libs = libs.split(";")
+        else:
+            libs = libs.split(":")
+
+        for path in libs:
+            if path.endswith("libcute_dsl_runtime.so"):
+                return path
+
+        return None
+
     libs = []
-    cuda_dialect_runtime_path = _get_cuda_dialect_runtime_path()
-    if cuda_dialect_runtime_path:
-        libs.append(cuda_dialect_runtime_path)
+    cute_dsl_runtime_path = _get_cute_dsl_runtime_path()
+    if cute_dsl_runtime_path:
+        libs.append(cute_dsl_runtime_path)
 
     if enable_tvm_ffi:
         import tvm_ffi
@@ -893,8 +962,8 @@ def find_runtime_libraries(*, enable_tvm_ffi: bool = True) -> List[str]:
 _LOAD_MODULE_LIBS_CACHE = []
 
 
-def load_module(file_path: str, *, enable_tvm_ffi: bool = True):
-    """Load a module from a file path. Today only support TVM-FFI module.
+def load_module(file_path: str, *, enable_tvm_ffi: bool = False):
+    """Load a module from a file path.
 
     :param file_path: The path to the module file
     :type file_path: str
@@ -910,14 +979,7 @@ def load_module(file_path: str, *, enable_tvm_ffi: bool = True):
             if Path(path).exists():
                 _LOAD_MODULE_LIBS_CACHE.append(ctypes.CDLL(path))
 
-    if enable_tvm_ffi:
-        import tvm_ffi
-
-        return tvm_ffi.load_module(file_path)
-    else:
-        raise DSLRuntimeError(
-            "Unimplemented, please load the module with enable_tvm_ffi=True."
-        )
+    return ExternalBinaryModule(file_path, enable_tvm_ffi=enable_tvm_ffi)
 
 # -------------------------------------------------------------------------
 # Try to register_jit_arg_adapter for TensorAdapter

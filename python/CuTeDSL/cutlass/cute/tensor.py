@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # Use of this software is governed by the terms and conditions of the
@@ -20,13 +20,38 @@ from cutlass.cutlass_dsl import (
     T,
     cutlass_arith,
     _binary_op_type_promote,
-    CuTeDSL,
+    MLIR_DYNAMIC,
+    BaseDSL,
 )
 from cutlass._mlir import ir
 import cutlass._mlir.dialects.cute as _cute_ir
 from cutlass._mlir.dialects.cute import ReductionOp as ReductionOp
 import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 from cutlass._mlir.dialects import vector, arith
+
+from .typing import (
+    Numeric,
+    Integer,
+    Boolean,
+    Int4,
+    Uint8,
+    Int8,
+    Int32,
+    Int64,
+    BFloat16,
+    IntTuple,
+    Coord,
+    Shape,
+    Stride,
+    Pointer,
+    Layout,
+    ComposedLayout,
+    Tensor,
+    AddressSpace,
+    is_integer,
+    is_int_tuple,
+    as_numeric,
+)
 
 from .core import (
     _unpack_x_tuple,
@@ -51,35 +76,31 @@ from .core import (
     recast_layout,
 )
 
-from .typing import (
-    IntTuple,
-    Coord,
-    Shape,
-    Stride,
-    Pointer,
-    Layout,
-    ComposedLayout,
-    Tensor,
-    AddressSpace,
-    is_integer,
-    is_int_tuple,
-    as_numeric,
-)
-from .typing import (
-    Numeric,
-    Integer,
-    Boolean,
-    Int4,
-    Uint8,
-    Int8,
-    Int32,
-    Float4E2M1FN,
-    Float16,
-    Float32,
-    BFloat16,
-)
 from .tuple import transform_leaf, product, product_like, flatten_to_tuple
-from .arch import cvt_i8_bf16_intrinsic, cvt_i4_bf16_intrinsic, cvt_f4e2m1_f16_intrinsic
+from .arch import cvt_i8_bf16_intrinsic, cvt_i4_bf16_intrinsic
+
+
+__all__ = [
+    "TensorSSA",
+    "ReductionOp",
+    "make_tensor",
+    "make_identity_tensor",
+    "make_fragment",
+    "make_fragment_like",
+    "make_rmem_tensor_like",
+    "make_rmem_tensor",
+    "recast_tensor",
+    "domain_offset",
+    "print_tensor",
+    "full",
+    "full_like",
+    "empty_like",
+    "ones_like",
+    "zeros_like",
+    "where",
+    "any_",
+    "all_",
+]
 
 
 @ir.register_value_caster(_cute_ir.MemRefType.get_static_typeid(), replace=True)
@@ -118,6 +139,19 @@ class _Tensor(Tensor):
     def __init__(
         self, value, dtype: Optional[Type[Numeric]] = None, *, loc=None, ip=None
     ):
+        """Initialize a Tensor from an MLIR value.
+
+        :param value: The MLIR operation result value or another Tensor to initialize from
+        :type value: Union[ir.Value, _Tensor]
+        :param dtype: The user specified data type of the tensor elements, defaults to None
+        :type dtype: Optional[Type[Numeric]]
+        :param loc: The source location for the operation, defaults to None
+        :type loc: Optional[Location]
+        :param ip: The insertion point for the operation, defaults to None
+        :type ip: Optional[InsertionPoint]
+        :raises TypeError: If value is not ir.Value or _Tensor
+        :raises TypeError: If iterator type is not supported
+        """
         self._dtype = dtype
         if isinstance(value, ir.Value):
             self.value = value
@@ -132,8 +166,9 @@ class _Tensor(Tensor):
         iter_val = _cute_ir.get_iter(self.value, loc=loc, ip=ip)
         if isinstance(iter_val, Pointer):
             self._iterator = iter_val
-        elif isinstance(iter_val.type, _cute_ir.IntTupleType):
-            self._iterator = _unpack_x_tuple(iter_val)
+        elif isinstance(iter_val.type, _cute_ir.ArithTupleIteratorType):
+            itup_val = _cute_ir.deref_arith_tuple_iter(iter_val)
+            self._iterator = _unpack_x_tuple(itup_val)
         elif isinstance(iter_val, ir.Value):
             # Example: SMEM descriptor iterator, not well supported today
             self._iterator = iter_val
@@ -151,6 +186,9 @@ class _Tensor(Tensor):
                 self._dtype = None
             else:
                 raise TypeError(f"unsupported iterator type, got {type(self.iterator)}")
+
+    def __repr__(self):
+        return self.__str__()
 
     def __str__(self):
         from .core import pretty_str
@@ -257,7 +295,8 @@ class _Tensor(Tensor):
             res = _cute_ir.get_iter(
                 slice_(self, crd, loc=loc, ip=ip).value, loc=loc, ip=ip
             )
-            return _unpack_x_tuple(res, loc=loc, ip=ip)
+            itup_val = _cute_ir.deref_arith_tuple_iter(res)
+            return _unpack_x_tuple(itup_val)
         else:
             self._check_can_load_store()
             self._check_can_dereference()
@@ -427,12 +466,23 @@ class _Tensor(Tensor):
         raise ValueError(f"{self} doesn't have memspace")
 
     @dsl_user_op
-    def load(self, *, loc=None, ip=None) -> "TensorSSA":
+    def load(
+        self,
+        *,
+        mask: Optional["TensorSSA"] = None,
+        pass_thru: Optional["TensorSSA"] = None,
+        loc=None,
+        ip=None,
+    ) -> "TensorSSA":
         """Load tensor elements as a vector.
 
         Loads all elements of the tensor into a vector representation, assuming the tensor
         has a static shape and is in a memory space that supports load operations.
 
+        :param mask: Mask vector, defaults to None
+        :type mask: Optional[TensorSSA]
+        :param pass_thru: Pass through vector, defaults to None
+        :type pass_thru: Optional[TensorSSA]
         :param loc: Source location for MLIR operation tracking, defaults to None
         :type loc: Optional[Location]
         :param ip: Insertion point for MLIR operation, defaults to None
@@ -448,9 +498,15 @@ class _Tensor(Tensor):
         if not is_static(self.shape):
             raise ValueError("dynamic layout doesn't support load")
 
-        self._check_can_load_store()
+        self._check_can_load_store(vectorized=True)
 
-        res_vect = _cute_ir.memref_load_vec(self.value, loc=loc, ip=ip)
+        mask_val = None if mask is None else mask.ir_value(loc=loc, ip=ip)
+        pass_thru_val = (
+            None if pass_thru is None else self._cvt_to_dest(pass_thru, loc=loc, ip=ip)
+        )
+        res_vect = _cute_ir.memref_load_vec(
+            self.value, mask=mask_val, pass_thru=pass_thru_val, loc=loc, ip=ip
+        )
         if self.element_type is Boolean:
             assert res_vect.type.element_type == T.i8(), (
                 f"Boolean tensor must be stored as i8 in memory, but got {res_vect.type.element_type}"
@@ -462,7 +518,14 @@ class _Tensor(Tensor):
         return TensorSSA(res_vect, self.shape, self.element_type)
 
     @dsl_user_op
-    def store(self, data: "TensorSSA", *, loc=None, ip=None):
+    def store(
+        self,
+        data: "TensorSSA",
+        *,
+        mask: Optional["TensorSSA"] = None,
+        loc=None,
+        ip=None,
+    ):
         """Store vector data into tensor.
 
         Stores vector data into the tensor, assuming matching shapes and a memory space
@@ -470,6 +533,8 @@ class _Tensor(Tensor):
 
         :param data: Vector data to store into tensor
         :type data: TensorSSA
+        :param mask: Mask vector, defaults to None
+        :type mask: Optional[TensorSSA]
         :param loc: Source location for MLIR operation tracking, defaults to None
         :type loc: Optional[Location]
         :param ip: Insertion point for MLIR operation, defaults to None
@@ -485,7 +550,7 @@ class _Tensor(Tensor):
         if not is_static(self.shape):
             raise ValueError("Dynamic layout doesn't support vectorized store")
 
-        self._check_can_load_store()
+        self._check_can_load_store(vectorized=True)
 
         n_elems = size(self.shape, loc=loc, ip=ip)
         if n_elems != size(data.shape, loc=loc, ip=ip):
@@ -503,7 +568,11 @@ class _Tensor(Tensor):
         # Implicit upcast to wider type
         new_data = self._cvt_to_dest(data, loc=loc, ip=ip)
 
-        return _cute_ir.memref_store_vec(new_data, self.value, loc=loc, ip=ip)
+        mask_val = None if mask is None else mask.ir_value(loc=loc, ip=ip)
+
+        return _cute_ir.memref_store_vec(
+            new_data, self.value, mask=mask_val, loc=loc, ip=ip
+        )
 
     @dsl_user_op
     def fill(self, value: Numeric, *, loc=None, ip=None) -> None:
@@ -532,7 +601,7 @@ class _Tensor(Tensor):
             # Fill tensor with constant value
             tensor.fill(0.5)  # All elements become 0.5
         """
-        self._check_can_load_store()
+        self._check_can_load_store(vectorized=True)
 
         sz = size(self, loc=loc, ip=ip)
         if type(sz) is not int:
@@ -546,7 +615,7 @@ class _Tensor(Tensor):
         )
         self.store(vect_val, loc=loc, ip=ip)
 
-    def _check_can_load_store(self):
+    def _check_can_load_store(self, vectorized: bool = False):
         if not isinstance(self.type, _cute_ir.MemRefType) or self.memspace not in (
             AddressSpace.rmem,
             AddressSpace.smem,
@@ -555,9 +624,9 @@ class _Tensor(Tensor):
         ):
             raise ValueError(f"{self} doesn't support load and store")
 
-        if self.type.is_swizzled:
+        if vectorized and isinstance(self.layout, ComposedLayout):
             raise NotImplementedError(
-                f"load & store swizzled memory is not supported yet: {self}"
+                "vectorized load/store on tensor with composed layout is not supported yet"
             )
 
     def _check_can_dereference(self):
@@ -633,7 +702,7 @@ def make_tensor(
     """
     if isinstance(layout, _ComposedLayoutWithInnerFunc):
         raise ValueError(
-            "CuTe DSL tensor does not support composed layouts with inner functions: {layout}"
+            f"CuTe DSL tensor does not support composed layouts with inner functions: {layout}"
         )
 
     if not isinstance(layout, (Layout, ComposedLayout)):
@@ -644,8 +713,12 @@ def make_tensor(
 
     res_ty = None
     if is_integer(iterator) or isinstance(iterator, tuple):
-        iterator = _pack_int_tuple(iterator, loc=loc, ip=ip)
-        res_ty = _cute_ir.CoordTensorType.get(iterator.type, layout.type)
+        itup_val = _pack_int_tuple(iterator, loc=loc, ip=ip)
+        iter_ty = _cute_ir.ArithTupleIteratorType.get(itup_val.type)
+        iterator = _cute_ir.make_arith_tuple_iter(
+            iter=iter_ty, value=itup_val, loc=loc, ip=ip
+        )
+        res_ty = _cute_ir.CoordTensorType.get(itup_val.type, layout.type)
     elif isinstance(iterator, Pointer):
         iterator = iterator.value
         res_ty = _cute_ir.MemRefType.get(iterator.type, layout.type)
@@ -773,7 +846,7 @@ def make_fragment(
 
 @dsl_user_op
 def make_rmem_tensor_like(
-    src: Union[Layout, ComposedLayout, Tensor],
+    src: Union[Layout, ComposedLayout, Tensor, "TensorSSA"],
     dtype: Optional[Type[Numeric]] = None,
     *,
     loc=None,
@@ -826,7 +899,7 @@ def make_rmem_tensor_like(
       create register storage for intermediate results.
 
     """
-    if not isinstance(src, (Layout, ComposedLayout, Tensor)):
+    if not isinstance(src, (Layout, ComposedLayout, Tensor, TensorSSA)):
         raise TypeError(
             f"src must be a Layout or ComposedLayout or Tensor, got {type(src)}"
         )
@@ -844,6 +917,9 @@ def make_rmem_tensor_like(
         else:
             res_dtype = dtype or src.element_type
             src_layout = src.layout
+    elif isinstance(src, TensorSSA):
+        res_dtype = dtype or src.element_type
+        src_layout = make_layout(src.shape, loc=loc, ip=ip)
     else:
         if dtype is None:
             raise ValueError("dtype must be provided when src is a layout")
@@ -889,6 +965,37 @@ def make_fragment_like(src, dtype=None, *, loc=None, ip=None):
 def recast_tensor(
     src: Tensor, dtype: Type[Numeric], swizzle_=None, *, loc=None, ip=None
 ):
+    """Recast a tensor to a different data type by changing the element interpretation.
+
+    This function reinterprets the memory of a tensor with a different element type,
+    adjusting both the iterator pointer type and the layout to maintain consistency.
+
+    :param src: The source tensor to recast
+    :type src: Tensor
+    :param dtype: The target data type for tensor elements
+    :type dtype: Type[Numeric]
+    :param swizzle_: Optional swizzle parameter (reserved for future use), defaults to None
+    :type swizzle_: Optional, unused
+    :param loc: Source location for MLIR operation tracking, defaults to None
+    :type loc: Optional[Location]
+    :param ip: Insertion point for MLIR operation, defaults to None
+    :type ip: Optional[InsertionPoint]
+    :return: A new tensor with the same memory but reinterpreted as dtype
+    :rtype: Tensor
+    :raises TypeError: If dtype is not a subclass of Numeric
+
+    **Examples:**
+
+    .. code-block:: python
+
+        # Create a Float32 tensor
+        tensor_f32 = make_rmem_tensor((4, 8), Float32)
+
+        # Recast to Int32 to manipulate bits
+        tensor_i32 = recast_tensor(tensor_f32, Int32)
+
+        # Both tensors share the same memory, but interpret it differently
+    """
     if not isclass(dtype) or not issubclass(dtype, Numeric):
         raise TypeError(f"dtype must be a type of Numeric, but got {dtype}")
 
@@ -909,6 +1016,36 @@ def recast_tensor(
 
 @dsl_user_op
 def domain_offset(coord: Coord, tensor: Tensor, *, loc=None, ip=None) -> Tensor:
+    """Offset the tensor domain by the given coordinate.
+
+    This function creates a new tensor by offsetting the iterator/pointer of the input tensor
+    by the amount corresponding to the given coordinate in its layout.
+
+    :param coord: The coordinate offset to apply
+    :type coord: Coord
+    :param tensor: The source tensor to offset
+    :type tensor: Tensor
+    :param loc: Source location for MLIR operation tracking, defaults to None
+    :type loc: Optional[Location]
+    :param ip: Insertion point for MLIR operation, defaults to None
+    :type ip: Optional[InsertionPoint]
+    :return: A new tensor with the offset iterator
+    :rtype: Tensor
+    :raises ValueError: If the tensor type doesn't support domain offsetting
+
+    **Examples:**
+
+    .. code-block:: python
+
+        # Create a tensor with a row-major layout
+        ptr = make_ptr(Float32, base_ptr, AddressSpace.gmem)
+        layout = make_layout((64, 128), stride=(128, 1))
+        tensor = make_tensor(ptr, layout)
+
+        # Offset by coordinate (3, 5)
+        offset_tensor = domain_offset((3, 5), tensor)
+        # offset_tensor now points to element at (3, 5)
+    """
     offset = crd2idx(coord, tensor.layout, loc=loc, ip=ip)
     if isinstance(tensor.iterator, Pointer):
         return make_tensor(
@@ -918,7 +1055,7 @@ def domain_offset(coord: Coord, tensor: Tensor, *, loc=None, ip=None) -> Tensor:
             ip=ip,
         )
     elif is_integer(tensor.iterator) or isinstance(tensor.iterator, tuple):
-        new_iter = _cute_ir.add_offset(
+        new_iter = _cute_ir.tuple_add(
             _pack_int_tuple(tensor.iterator, loc=loc, ip=ip),
             _pack_int_tuple(offset, loc=loc, ip=ip),
             loc=loc,
@@ -978,8 +1115,10 @@ def print_tensor(
             signed = tensor.element_type.signed
         else:
             signed = False
-    else:
+    elif isinstance(tensor.type, _cute_ir.CoordTensorType):
         signed = True
+    else:
+        raise ValueError(f"unsupported tensor type for print_tensor, got {tensor.type}")
 
     _cute_ir.print_view(tensor.value, verbose=verbose, is_signed=signed, loc=loc, ip=ip)
 
@@ -1136,10 +1275,12 @@ class TensorSSA(cutlass_arith.ArithValue):
     def _apply_op(
         self, op, other: "TensorSSA", flip=False, *, loc, ip
     ) -> "TensorSSA": ...
+
     @overload
     def _apply_op(
         self, op, other: cutlass_arith.ArithValue, flip=False, *, loc, ip
     ) -> "TensorSSA": ...
+
     @overload
     def _apply_op(
         self, op, other: Union[int, float, bool], flip=False, *, loc, ip
@@ -1688,7 +1829,8 @@ class TensorSSA(cutlass_arith.ArithValue):
             idx = crd2idx(crd, self._layout, loc=loc, ip=ip)
             assert not isinstance(idx, tuple), "index must be scalar"
             idx_val = as_numeric(idx).ir_value(loc=loc, ip=ip)
-            res_val = vector.extractelement(self, position=idx_val, loc=loc, ip=ip)
+            idx_val = arith.index_cast(T.index(), idx_val, loc=loc, ip=ip)
+            res_val = vector.extract(self, [idx_val], [MLIR_DYNAMIC], loc=loc, ip=ip)
             return self.dtype(res_val)
 
         if not is_static(crd):
@@ -1755,16 +1897,7 @@ class TensorSSA(cutlass_arith.ArithValue):
         # maybe downcast can lose signedness
         src = self.maybe_downcast().with_signedness(self.signed)
         if src_dtype.is_float and dtype.is_float:
-            if src_dtype == Float4E2M1FN and dtype in (Float16, Float32):
-                res_vect = cvt_f4e2m1_f16_intrinsic(
-                    src, size(self.shape), loc=loc, ip=ip
-                )
-                if dtype == Float32:
-                    res_vect = cutlass_arith.cvtf(
-                        res_vect, dtype.mlir_type, loc=loc, ip=ip
-                    )
-            else:
-                res_vect = cutlass_arith.cvtf(src, dtype.mlir_type, loc=loc, ip=ip)
+            res_vect = cutlass_arith.cvtf(src, dtype.mlir_type, loc=loc, ip=ip)
         elif src_dtype.is_float and issubclass(dtype, Integer):
             res_vect = cutlass_arith.fptoi(
                 src, dtype.signed, dtype.mlir_type, loc=loc, ip=ip
@@ -1776,7 +1909,7 @@ class TensorSSA(cutlass_arith.ArithValue):
                 fast_cvt_func = cvt_i8_bf16_intrinsic
             elif src_dtype == Int4 and dtype == BFloat16:
                 fast_cvt_func = cvt_i4_bf16_intrinsic
-            arch = CuTeDSL._get_dsl().get_arch_enum()
+            arch = BaseDSL._get_dsl().get_arch_enum()
             if fast_cvt_func is not None and arch in fast_cvt_func.supported_archs:
                 res_vect = fast_cvt_func(src, size(self.shape), loc=loc, ip=ip)
             else:
